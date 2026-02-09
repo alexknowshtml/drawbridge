@@ -8,5 +8,7 @@ services:
       - "5050:3062"
     volumes:
       - ./data:/app/data
+    env_file:
+      - .env
     environment:
       - DRAWBRIDGE_PORT=3062

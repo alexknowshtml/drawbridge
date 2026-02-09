@@ -29,6 +29,7 @@ import { createServer } from 'http';
 import { parse } from 'url';
 import { mkdirSync, existsSync, readFileSync, writeFileSync, appendFileSync, unlinkSync, renameSync } from 'fs';
 import { join } from 'path';
+import { initSpacesClient, isSpacesEnabled, uploadFile } from './lib/spaces-client.js';
 
 const PORT = parseInt(process.env.DRAWBRIDGE_PORT || '3062');
 const DATA_DIR = process.env.DRAWBRIDGE_DATA_DIR || join(import.meta.dirname, 'data');
@@ -92,7 +93,7 @@ function applyOp(session, op) {
 }
 
 function loadSession(sessionId) {
-  const session = { elements: [], appState: null, viewport: null, clients: new Set(), _opsSinceSnapshot: 0 };
+  const session = { elements: [], appState: null, viewport: null, files: {}, clients: new Set(), _opsSinceSnapshot: 0 };
 
   // Load snapshot if exists
   const sp = snapshotPath(sessionId);
@@ -121,12 +122,39 @@ function loadSession(sessionId) {
     }
   }
 
+  // Load file metadata (image CDN URLs)
+  session.files = loadFilesMeta(sessionId);
+
   return session;
 }
 
 function deleteSessionFiles(sessionId) {
   try { unlinkSync(snapshotPath(sessionId)); } catch {}
   try { unlinkSync(logPath(sessionId)); } catch {}
+  try { unlinkSync(filesMetaPath(sessionId)); } catch {}
+}
+
+// --- File metadata persistence (image CDN URLs) ---
+
+function filesMetaPath(sessionId) {
+  return join(DATA_DIR, `${sessionId}.files.json`);
+}
+
+function loadFilesMeta(sessionId) {
+  const fp = filesMetaPath(sessionId);
+  if (!existsSync(fp)) return {};
+  try {
+    return JSON.parse(readFileSync(fp, 'utf-8'));
+  } catch (err) {
+    console.error(`[Persist] Failed to load files for ${sessionId}:`, err.message);
+    return {};
+  }
+}
+
+function saveFilesMeta(sessionId, filesMeta) {
+  const tmp = filesMetaPath(sessionId) + '.tmp';
+  writeFileSync(tmp, JSON.stringify(filesMeta));
+  renameSync(tmp, filesMetaPath(sessionId));
 }
 
 // Pop the last operation from the log, rebuild state
@@ -204,7 +232,7 @@ const wss = new WebSocketServer({ noServer: true });
 // --- HTTP API Server (port 3062) ---
 
 const app = express();
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '50mb' }));
 
 // CORS for local dev
 app.use((_req, res, next) => {
@@ -323,6 +351,7 @@ app.post('/api/session/:id/clear', (req, res) => {
   session.elements = [];
   session.appState = null;
   session.viewport = null;
+  session.files = {};
   deleteSessionFiles(req.params.id);
 
   broadcast(session, { type: 'clear' });
@@ -347,12 +376,75 @@ app.post('/api/session/:id/undo', (req, res) => {
   }
 });
 
+// Upload a file (image) to DO Spaces
+app.post('/api/session/:id/files', async (req, res) => {
+  if (!isSpacesEnabled()) {
+    return res.status(503).json({ error: 'Image storage not configured' });
+  }
+
+  const { fileId, dataURL, mimeType } = req.body;
+  if (!fileId || !dataURL || !mimeType) {
+    return res.status(400).json({ error: 'Missing fileId, dataURL, or mimeType' });
+  }
+
+  try {
+    const session = getSession(req.params.id);
+
+    // Skip if already uploaded
+    if (session.files[fileId]) {
+      return res.json({ success: true, fileId, cdnUrl: session.files[fileId].cdnUrl });
+    }
+
+    const cdnUrl = await uploadFile(req.params.id, fileId, dataURL, mimeType);
+
+    session.files[fileId] = { id: fileId, cdnUrl, mimeType, created: Date.now() };
+    saveFilesMeta(req.params.id, session.files);
+
+    // Broadcast to other clients so they can fetch the image
+    broadcast(session, { type: 'file-added', file: session.files[fileId] });
+
+    console.log(`[Files] Uploaded ${fileId} for session ${req.params.id}`);
+    res.json({ success: true, fileId, cdnUrl });
+  } catch (err) {
+    console.error('[Files] Upload error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get file metadata for a session
+app.get('/api/session/:id/files', (req, res) => {
+  const session = getSession(req.params.id);
+  res.json({ files: session.files || {} });
+});
+
+// Proxy file downloads to avoid CORS issues with DO Spaces
+app.get('/api/session/:id/files/:fileId', async (req, res) => {
+  const session = getSession(req.params.id);
+  const fileMeta = session.files[req.params.fileId];
+  if (!fileMeta) {
+    return res.status(404).json({ error: 'File not found' });
+  }
+
+  try {
+    const upstream = await fetch(fileMeta.cdnUrl);
+    if (!upstream.ok) throw new Error(`Upstream ${upstream.status}`);
+    res.set('Content-Type', fileMeta.mimeType);
+    res.set('Cache-Control', 'public, max-age=31536000, immutable');
+    const buffer = Buffer.from(await upstream.arrayBuffer());
+    res.send(buffer);
+  } catch (err) {
+    console.error(`[Files] Proxy error for ${req.params.fileId}:`, err.message);
+    res.status(502).json({ error: 'Failed to fetch file' });
+  }
+});
+
 // Serve built frontend (for containerized/production deployment)
 const staticDir = join(import.meta.dirname, 'dist');
 if (existsSync(staticDir)) {
   app.use(express.static(staticDir));
-  // SPA fallback — serve index.html for non-API routes
-  app.get('{*path}', (_req, res) => {
+  // SPA fallback — serve index.html for non-API, non-WebSocket routes
+  app.get('{*path}', (req, res, next) => {
+    if (req.path.startsWith('/ws/') || req.path.startsWith('/api/')) return next();
     res.sendFile(join(staticDir, 'index.html'));
   });
   console.log(`[HTTP] Serving static files from ${staticDir}`);
@@ -388,6 +480,9 @@ wss.on('connection', (ws, request) => {
   }
   if (session.viewport) {
     ws.send(JSON.stringify({ type: 'viewport', viewport: session.viewport }));
+  }
+  if (session.files && Object.keys(session.files).length > 0) {
+    ws.send(JSON.stringify({ type: 'files-meta', files: session.files }));
   }
 
   let persistTimer = null;
@@ -431,6 +526,13 @@ wss.on('connection', (ws, request) => {
     }
   });
 });
+
+// Initialize DO Spaces client for image storage
+if (initSpacesClient(process.env)) {
+  console.log(`[Spaces] Image storage enabled (bucket: ${process.env.DO_SPACES_BUCKET})`);
+} else {
+  console.warn('[Spaces] Image storage disabled — set DO_SPACES_ACCESS_KEY, DO_SPACES_SECRET_KEY, DO_SPACES_BUCKET');
+}
 
 httpServer.listen(PORT, () => {
   console.log(`[HTTP] API + WebSocket server running on port ${PORT}`);

@@ -11,6 +11,7 @@
     "render": "npx tsx scripts/render.ts"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.985.0",
     "@excalidraw/excalidraw": "^0.18.0",
     "express": "^5.1.0",
     "react": "^19.0.0",
@@ -28,7 +29,15 @@
     "typescript": "^5.7.2",
     "vite": "^6.0.0"
   },
-  "keywords": ["excalidraw", "diagram", "real-time", "websocket", "claude", "ai", "drawing"],
+  "keywords": [
+    "excalidraw",
+    "diagram",
+    "real-time",
+    "websocket",
+    "claude",
+    "ai",
+    "drawing"
+  ],
   "license": "MIT",
   "repository": {
     "type": "git",
