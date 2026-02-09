@@ -104,6 +104,35 @@ function playPencilSound(type: string) {
   }
 }
 
+// localStorage persistence — cache elements per session
+const STORAGE_PREFIX = 'drawbridge:';
+
+function saveToStorage(sessionId: string, elements: any[]) {
+  try {
+    localStorage.setItem(`${STORAGE_PREFIX}${sessionId}`, JSON.stringify(elements));
+  } catch {
+    // Storage full or unavailable — non-critical
+  }
+}
+
+function loadFromStorage(sessionId: string): any[] | null {
+  try {
+    const stored = localStorage.getItem(`${STORAGE_PREFIX}${sessionId}`);
+    if (stored) return JSON.parse(stored);
+  } catch {
+    // Parse error — ignore
+  }
+  return null;
+}
+
+function clearStorage(sessionId: string) {
+  try {
+    localStorage.removeItem(`${STORAGE_PREFIX}${sessionId}`);
+  } catch {
+    // Non-critical
+  }
+}
+
 interface Viewport {
   x: number;
   y: number;
@@ -120,9 +149,17 @@ export default function App() {
   const isRemoteUpdate = useRef(false);
   const reconnectTimer = useRef<number | null>(null);
   const lastElementCount = useRef(0);
+  const [cachedElements, setCachedElements] = useState<any[] | null>(null);
 
-  // Preload fonts on mount
-  useEffect(() => { ensureFontsLoaded(); }, []);
+  // Preload fonts and load cached elements on mount
+  useEffect(() => {
+    ensureFontsLoaded();
+    const cached = loadFromStorage(sessionId);
+    if (cached && cached.length > 0) {
+      setCachedElements(cached);
+      lastElementCount.current = cached.length;
+    }
+  }, [sessionId]);
 
   // Apply viewport: convert scene-space rect to Excalidraw scrollX/scrollY/zoom
   const applyViewport = useCallback((viewport: Viewport) => {
@@ -188,18 +225,21 @@ export default function App() {
               playPencilSound(clean[i].type || 'rectangle');
             }
             lastElementCount.current = clean.length;
+            saveToStorage(sessionId, clean);
             setTimeout(() => { isRemoteUpdate.current = false; }, 100);
             setStatus(`Connected - Session: ${sessionId} - ${clean.length} elements`);
           } else if (msg.type === 'append' && excalidrawAPI) {
             isRemoteUpdate.current = true;
             const current = excalidrawAPI.getSceneElements();
             const clean = await sanitizeElements(msg.elements);
-            excalidrawAPI.updateScene({ elements: [...current, ...clean] });
+            const allElements = [...current, ...clean];
+            excalidrawAPI.updateScene({ elements: allElements });
             // Play sounds for appended elements
             for (const el of clean) {
               playPencilSound(el.type || 'rectangle');
             }
-            lastElementCount.current = current.length + clean.length;
+            lastElementCount.current = allElements.length;
+            saveToStorage(sessionId, allElements);
             setTimeout(() => { isRemoteUpdate.current = false; }, 100);
           } else if (msg.type === 'viewport' && excalidrawAPI) {
             applyViewport(msg.viewport);
@@ -207,6 +247,7 @@ export default function App() {
             isRemoteUpdate.current = true;
             excalidrawAPI.resetScene();
             lastElementCount.current = 0;
+            clearStorage(sessionId);
             setTimeout(() => { isRemoteUpdate.current = false; }, 100);
           }
         } catch (err) {
@@ -242,14 +283,20 @@ export default function App() {
   const onChange = useCallback(
     (elements: readonly any[]) => {
       if (isRemoteUpdate.current) return;
+
+      const activeElements = elements.filter((el: any) => !el.isDeleted);
+
+      // Always save to localStorage, even if WebSocket is disconnected
+      saveToStorage(sessionId, activeElements as any[]);
+
       if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
 
       wsRef.current.send(JSON.stringify({
         type: 'update',
-        elements: elements.filter((el: any) => !el.isDeleted),
+        elements: activeElements,
       }));
     },
-    []
+    [sessionId]
   );
 
   return (
@@ -277,6 +324,7 @@ export default function App() {
         excalidrawAPI={(api: any) => setExcalidrawAPI(api)}
         onChange={onChange}
         initialData={{
+          elements: cachedElements || [],
           appState: {
             viewBackgroundColor: '#ffffff',
             theme: 'light' as const,
