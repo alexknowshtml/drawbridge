@@ -831,7 +831,7 @@ export default function App() {
         onClick={showHistory ? () => { if (previewingVersion) cancelPreview(); setShowHistory(false); } : openHistory}
         title="Version History (Ctrl+H)"
         style={{
-          position: 'absolute', bottom: 14, left: 254, zIndex: 50,
+          position: 'absolute', bottom: 18, left: 254, zIndex: 50,
           width: 36, height: 36, borderRadius: 8,
           border: 'none', background: showHistory ? '#d0ebff' : '#ececf4',
           cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
