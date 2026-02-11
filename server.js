@@ -666,13 +666,21 @@ wss.on('connection', (ws, request) => {
 
         session.elements = msg.elements;
         session._version++;
+
+        // Track who made this edit
+        const editorInfo = {
+          clientId: msg.clientId || 'unknown',
+          clientName: msg.clientName || '',
+        };
+        session._lastEditor = editorInfo;
+
         if (persistTimer) clearTimeout(persistTimer);
         persistTimer = setTimeout(() => {
           appendLog(sessionId, session, { type: 'update', elements: session.elements });
         }, 500);
         for (const client of session.clients) {
           if (client !== ws && client.readyState === WebSocket.OPEN) {
-            client.send(JSON.stringify({ type: 'elements', elements: msg.elements, version: session._version }));
+            client.send(JSON.stringify({ type: 'elements', elements: msg.elements, version: session._version, editor: editorInfo }));
           }
         }
       }

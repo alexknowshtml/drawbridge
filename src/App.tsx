@@ -132,6 +132,8 @@ interface VersionEntry {
   elementCount: number;
   source: 'local' | 'server' | 'restored' | 'conflict-local' | 'conflict-server';
   restoredFrom?: number; // version number this was restored from
+  editorId?: string;
+  editorName?: string;
 }
 
 class VersionHistory {
@@ -153,7 +155,7 @@ class VersionHistory {
     });
   }
 
-  async saveVersion(sessionId: string, elements: any[], source: VersionEntry['source'] = 'local', restoredFrom?: number): Promise<void> {
+  async saveVersion(sessionId: string, elements: any[], source: VersionEntry['source'] = 'local', restoredFrom?: number, editorId?: string, editorName?: string): Promise<void> {
     try {
       const db = await this.dbPromise;
       const tx = db.transaction(IDB_STORE, 'readwrite');
@@ -165,6 +167,8 @@ class VersionHistory {
         elementCount: elements.length,
         source,
         ...(restoredFrom !== undefined && { restoredFrom }),
+        ...(editorId && { editorId }),
+        ...(editorName && { editorName }),
       };
       store.add(entry);
       await new Promise<void>((resolve, reject) => {
@@ -514,7 +518,11 @@ export default function App() {
                 const now = Date.now();
                 if (now - lastVersionSave.current > VERSION_SAVE_THROTTLE_MS) {
                   lastVersionSave.current = now;
-                  versionHistory.saveVersion(sessionId, serverElements, msg.source === 'restore' ? 'restored' : 'server');
+                  versionHistory.saveVersion(
+                    sessionId, serverElements,
+                    msg.source === 'restore' ? 'restored' : 'server',
+                    undefined, msg.editor?.clientId, msg.editor?.clientName,
+                  );
                   versionHistory.pruneOldVersions(sessionId);
                 }
 
@@ -617,7 +625,7 @@ export default function App() {
       const now = Date.now();
       if (now - lastVersionSave.current > VERSION_SAVE_THROTTLE_MS) {
         lastVersionSave.current = now;
-        versionHistory.saveVersion(sessionId, activeElements as any[], 'local');
+        versionHistory.saveVersion(sessionId, activeElements as any[], 'local', undefined, clientId, clientName);
         versionHistory.pruneOldVersions(sessionId);
       }
 
@@ -627,6 +635,8 @@ export default function App() {
         type: 'update',
         elements: activeElements,
         baseVersion: serverVersion.current,
+        clientId,
+        clientName,
       }));
 
       // Check for new image files via API (more reliable than onChange 3rd arg)
@@ -655,7 +665,7 @@ export default function App() {
 
     // Push chosen state to server
     if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: 'update', elements, baseVersion: serverVersion.current }));
+      wsRef.current.send(JSON.stringify({ type: 'update', elements, baseVersion: serverVersion.current, clientId, clientName }));
     }
 
     setConflict(null);
@@ -753,7 +763,7 @@ export default function App() {
       await versionHistory.saveVersion(sessionId, elements, 'restored', fromVersion);
 
       if (wsRef.current?.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({ type: 'update', elements, baseVersion: serverVersion.current }));
+        wsRef.current.send(JSON.stringify({ type: 'update', elements, baseVersion: serverVersion.current, clientId, clientName }));
       }
       setTimeout(() => { isRemoteUpdate.current = false; }, 100);
     }
@@ -791,6 +801,8 @@ export default function App() {
       elements?: any[];
       serverTimestamp?: number;
       restoredFrom?: number;
+      editorId?: string;
+      editorName?: string;
     }> = [];
 
     for (const entry of historyEntries) {
@@ -800,6 +812,8 @@ export default function App() {
         source: entry.source,
         elements: entry.elements,
         restoredFrom: entry.restoredFrom,
+        editorId: entry.editorId,
+        editorName: entry.editorName,
       });
     }
 
@@ -922,6 +936,11 @@ export default function App() {
                          v.source === 'conflict-local' ? 'conflict (yours)' :
                          v.source === 'conflict-server' ? 'conflict (server)' : v.source}
                       </span>
+                      {(v.editorName || v.editorId) && (
+                        <span style={{ fontSize: 10, color: '#868e96' }}>
+                          by {v.editorName || v.editorId}
+                        </span>
+                      )}
                     </div>
                   </div>
                   <div style={{ display: 'flex', gap: 4 }}>
