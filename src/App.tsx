@@ -96,6 +96,124 @@ function playPencilSound(type: string) {
   }
 }
 
+// --- IndexedDB Version History ---
+
+const IDB_NAME = 'drawbridge-history';
+const IDB_STORE = 'versions';
+const IDB_VERSION = 1;
+const MAX_VERSIONS_PER_SESSION = 20;
+const VERSION_SAVE_THROTTLE_MS = 30_000; // 30 seconds
+
+interface VersionEntry {
+  id?: number; // auto-increment key
+  timestamp: number;
+  sessionId: string;
+  elements: any[];
+  elementCount: number;
+  source: 'local' | 'server' | 'restored' | 'conflict-local' | 'conflict-server';
+}
+
+class VersionHistory {
+  private dbPromise: Promise<IDBDatabase>;
+
+  constructor() {
+    this.dbPromise = new Promise((resolve, reject) => {
+      const request = indexedDB.open(IDB_NAME, IDB_VERSION);
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        if (!db.objectStoreNames.contains(IDB_STORE)) {
+          const store = db.createObjectStore(IDB_STORE, { keyPath: 'id', autoIncrement: true });
+          store.createIndex('sessionId', 'sessionId', { unique: false });
+          store.createIndex('session-timestamp', ['sessionId', 'timestamp'], { unique: false });
+        }
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  async saveVersion(sessionId: string, elements: any[], source: VersionEntry['source'] = 'local'): Promise<void> {
+    try {
+      const db = await this.dbPromise;
+      const tx = db.transaction(IDB_STORE, 'readwrite');
+      const store = tx.objectStore(IDB_STORE);
+      const entry: Omit<VersionEntry, 'id'> = {
+        timestamp: Date.now(),
+        sessionId,
+        elements,
+        elementCount: elements.length,
+        source,
+      };
+      store.add(entry);
+      await new Promise<void>((resolve, reject) => {
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+    } catch (err) {
+      console.error('[VersionHistory] Save failed:', err);
+    }
+  }
+
+  async getLatestVersion(sessionId: string): Promise<VersionEntry | null> {
+    try {
+      const db = await this.dbPromise;
+      const tx = db.transaction(IDB_STORE, 'readonly');
+      const store = tx.objectStore(IDB_STORE);
+      const index = store.index('session-timestamp');
+      const range = IDBKeyRange.bound([sessionId, 0], [sessionId, Infinity]);
+      const request = index.openCursor(range, 'prev');
+      return new Promise((resolve, reject) => {
+        request.onsuccess = () => {
+          const cursor = request.result;
+          resolve(cursor ? cursor.value : null);
+        };
+        request.onerror = () => reject(request.error);
+      });
+    } catch {
+      return null;
+    }
+  }
+
+  async listVersions(sessionId: string): Promise<VersionEntry[]> {
+    try {
+      const db = await this.dbPromise;
+      const tx = db.transaction(IDB_STORE, 'readonly');
+      const store = tx.objectStore(IDB_STORE);
+      const index = store.index('session-timestamp');
+      const range = IDBKeyRange.bound([sessionId, 0], [sessionId, Infinity]);
+      const request = index.getAll(range);
+      return new Promise((resolve, reject) => {
+        request.onsuccess = () => resolve((request.result || []).reverse()); // newest first
+        request.onerror = () => reject(request.error);
+      });
+    } catch {
+      return [];
+    }
+  }
+
+  async pruneOldVersions(sessionId: string): Promise<void> {
+    try {
+      const versions = await this.listVersions(sessionId);
+      if (versions.length <= MAX_VERSIONS_PER_SESSION) return;
+      const toDelete = versions.slice(MAX_VERSIONS_PER_SESSION);
+      const db = await this.dbPromise;
+      const tx = db.transaction(IDB_STORE, 'readwrite');
+      const store = tx.objectStore(IDB_STORE);
+      for (const v of toDelete) {
+        if (v.id !== undefined) store.delete(v.id);
+      }
+      await new Promise<void>((resolve, reject) => {
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+    } catch (err) {
+      console.error('[VersionHistory] Prune failed:', err);
+    }
+  }
+}
+
+const versionHistory = new VersionHistory();
+
 // localStorage persistence — cache elements per session
 const STORAGE_PREFIX = 'drawbridge:';
 
@@ -182,6 +300,23 @@ export default function App() {
   const reconnectTimer = useRef<number | null>(null);
   const lastElementCount = useRef(0);
   const [cachedElements, setCachedElements] = useState<any[] | null>(null);
+
+  // Conflict resolution state
+  const [conflict, setConflict] = useState<{
+    localElements: any[];
+    serverElements: any[];
+    viewing: 'local' | 'server';
+  } | null>(null);
+
+  // Version history panel
+  const [showHistory, setShowHistory] = useState(false);
+  const [historyEntries, setHistoryEntries] = useState<VersionEntry[]>([]);
+  const [serverVersions, setServerVersions] = useState<any[]>([]);
+  const [previewingVersion, setPreviewingVersion] = useState<number | null>(null);
+  const previewOriginalElements = useRef<any[] | null>(null);
+
+  // Throttle IndexedDB saves
+  const lastVersionSave = useRef(0);
 
   // Use ref for excalidrawAPI so WebSocket handler doesn't need to reconnect
   const apiRef = useRef<any>(null);
@@ -299,20 +434,51 @@ export default function App() {
             const api = apiRef.current;
 
             if (msg.type === 'elements' && api) {
-              isRemoteUpdate.current = true;
-              const clean = await sanitizeElements(msg.elements);
-              api.updateScene({ elements: clean });
-              if (msg.appState) {
-                api.updateScene({ appState: msg.appState });
+              const serverElements = await sanitizeElements(msg.elements);
+              const localElements = api.getSceneElements().filter((el: any) => !el.isDeleted);
+
+              // Compare element IDs to detect conflicts
+              const localIds = localElements.map((el: any) => el.id).sort().join(',');
+              const serverIds = serverElements.map((el: any) => el.id).sort().join(',');
+              const hasConflict = localIds !== serverIds && localElements.length > 0;
+
+              if (hasConflict && !msg.source) {
+                // Save both states to IndexedDB
+                await versionHistory.saveVersion(sessionId, localElements, 'conflict-local');
+                await versionHistory.saveVersion(sessionId, serverElements, 'conflict-server');
+
+                // Show conflict banner - don't apply server state yet
+                setConflict({
+                  localElements,
+                  serverElements,
+                  viewing: 'local',
+                });
+                setStatus(`Connected - Session: ${sessionId} - CONFLICT DETECTED`);
+              } else {
+                // No conflict or this is a restore broadcast - apply silently
+                isRemoteUpdate.current = true;
+                api.updateScene({ elements: serverElements });
+                if (msg.appState) {
+                  api.updateScene({ appState: msg.appState });
+                }
+                const prevCount = lastElementCount.current;
+                for (let i = prevCount; i < serverElements.length; i++) {
+                  playPencilSound(serverElements[i].type || 'rectangle');
+                }
+                lastElementCount.current = serverElements.length;
+                saveToStorage(sessionId, serverElements);
+
+                // Save to IndexedDB (throttled)
+                const now = Date.now();
+                if (now - lastVersionSave.current > VERSION_SAVE_THROTTLE_MS) {
+                  lastVersionSave.current = now;
+                  versionHistory.saveVersion(sessionId, serverElements, msg.source === 'restore' ? 'restored' : 'server');
+                  versionHistory.pruneOldVersions(sessionId);
+                }
+
+                setTimeout(() => { isRemoteUpdate.current = false; }, 100);
+                setStatus(`Connected - Session: ${sessionId} - ${serverElements.length} elements`);
               }
-              const prevCount = lastElementCount.current;
-              for (let i = prevCount; i < clean.length; i++) {
-                playPencilSound(clean[i].type || 'rectangle');
-              }
-              lastElementCount.current = clean.length;
-              saveToStorage(sessionId, clean);
-              setTimeout(() => { isRemoteUpdate.current = false; }, 100);
-              setStatus(`Connected - Session: ${sessionId} - ${clean.length} elements`);
             } else if (msg.type === 'append' && api) {
               isRemoteUpdate.current = true;
               const current = api.getSceneElements();
@@ -405,6 +571,14 @@ export default function App() {
 
       saveToStorage(sessionId, activeElements as any[]);
 
+      // Save to IndexedDB (throttled to every 30s)
+      const now = Date.now();
+      if (now - lastVersionSave.current > VERSION_SAVE_THROTTLE_MS) {
+        lastVersionSave.current = now;
+        versionHistory.saveVersion(sessionId, activeElements as any[], 'local');
+        versionHistory.pruneOldVersions(sessionId);
+      }
+
       if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
 
       wsRef.current.send(JSON.stringify({
@@ -424,8 +598,304 @@ export default function App() {
     [sessionId, uploadNewFiles]
   );
 
+  // --- Conflict resolution handlers ---
+
+  const resolveConflict = useCallback((choice: 'local' | 'server') => {
+    if (!conflict || !excalidrawAPI) return;
+    const elements = choice === 'local' ? conflict.localElements : conflict.serverElements;
+
+    isRemoteUpdate.current = true;
+    excalidrawAPI.updateScene({ elements });
+    lastElementCount.current = elements.length;
+    saveToStorage(sessionId, elements);
+    versionHistory.saveVersion(sessionId, elements, 'restored');
+
+    // Push chosen state to server
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'update', elements }));
+    }
+
+    setConflict(null);
+    setTimeout(() => { isRemoteUpdate.current = false; }, 100);
+    setStatus(`Connected - Session: ${sessionId} - ${elements.length} elements`);
+  }, [conflict, excalidrawAPI, sessionId]);
+
+  const toggleConflictView = useCallback(() => {
+    if (!conflict || !excalidrawAPI) return;
+    const next = conflict.viewing === 'local' ? 'server' : 'local';
+    const elements = next === 'local' ? conflict.localElements : conflict.serverElements;
+    isRemoteUpdate.current = true;
+    excalidrawAPI.updateScene({ elements });
+    setTimeout(() => { isRemoteUpdate.current = false; }, 100);
+    setConflict({ ...conflict, viewing: next });
+  }, [conflict, excalidrawAPI]);
+
+  // --- Version history handlers ---
+
+  const loadHistoryEntries = useCallback(async () => {
+    const local = await versionHistory.listVersions(sessionId);
+    setHistoryEntries(local);
+
+    try {
+      const resp = await fetch(`${getApiBase()}/session/${sessionId}/versions`);
+      if (resp.ok) {
+        const data = await resp.json();
+        setServerVersions(data.versions || []);
+      }
+    } catch {
+      setServerVersions([]);
+    }
+  }, [sessionId]);
+
+  const openHistory = useCallback(() => {
+    loadHistoryEntries();
+    setShowHistory(true);
+  }, [loadHistoryEntries]);
+
+  const previewVersion = useCallback((elements: any[]) => {
+    if (!excalidrawAPI) return;
+    if (!previewOriginalElements.current) {
+      previewOriginalElements.current = excalidrawAPI.getSceneElements().filter((el: any) => !el.isDeleted);
+    }
+    isRemoteUpdate.current = true;
+    excalidrawAPI.updateScene({ elements });
+    setPreviewingVersion(Date.now());
+    setTimeout(() => { isRemoteUpdate.current = false; }, 100);
+  }, [excalidrawAPI]);
+
+  const cancelPreview = useCallback(() => {
+    if (!excalidrawAPI || !previewOriginalElements.current) return;
+    isRemoteUpdate.current = true;
+    excalidrawAPI.updateScene({ elements: previewOriginalElements.current });
+    previewOriginalElements.current = null;
+    setPreviewingVersion(null);
+    setTimeout(() => { isRemoteUpdate.current = false; }, 100);
+  }, [excalidrawAPI]);
+
+  const restoreVersion = useCallback(async (elements: any[], source: 'local' | 'server', serverTimestamp?: number) => {
+    if (!excalidrawAPI) return;
+
+    if (source === 'server' && serverTimestamp) {
+      // Restore via server API
+      try {
+        await fetch(`${getApiBase()}/session/${sessionId}/restore`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ timestamp: serverTimestamp }),
+        });
+      } catch (err) {
+        console.error('[History] Server restore failed:', err);
+      }
+    } else {
+      // Local restore: apply + push to server
+      isRemoteUpdate.current = true;
+      excalidrawAPI.updateScene({ elements });
+      lastElementCount.current = elements.length;
+      saveToStorage(sessionId, elements);
+      await versionHistory.saveVersion(sessionId, elements, 'restored');
+
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ type: 'update', elements }));
+      }
+      setTimeout(() => { isRemoteUpdate.current = false; }, 100);
+    }
+
+    previewOriginalElements.current = null;
+    setPreviewingVersion(null);
+    setShowHistory(false);
+    setStatus(`Connected - Session: ${sessionId} - ${elements.length} elements (restored)`);
+  }, [excalidrawAPI, sessionId]);
+
+  // Ctrl+H keyboard shortcut for history
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'h') {
+        e.preventDefault();
+        if (showHistory) {
+          if (previewingVersion) cancelPreview();
+          setShowHistory(false);
+        } else {
+          openHistory();
+        }
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [showHistory, previewingVersion, cancelPreview, openHistory]);
+
+  // Merge local + server versions for the history panel
+  const allVersions = (() => {
+    const merged: Array<{
+      timestamp: number;
+      elementCount: number;
+      source: string;
+      elements?: any[];
+      serverTimestamp?: number;
+    }> = [];
+
+    for (const entry of historyEntries) {
+      merged.push({
+        timestamp: entry.timestamp,
+        elementCount: entry.elementCount,
+        source: entry.source,
+        elements: entry.elements,
+      });
+    }
+
+    for (const sv of serverVersions) {
+      // Skip if we already have a client entry within 2s of this timestamp
+      const hasDupe = historyEntries.some(e => Math.abs(e.timestamp - sv.timestamp) < 2000);
+      if (!hasDupe) {
+        merged.push({
+          timestamp: sv.timestamp,
+          elementCount: sv.elementCount,
+          source: 'server-backup',
+          serverTimestamp: sv.timestamp,
+        });
+      }
+    }
+
+    merged.sort((a, b) => b.timestamp - a.timestamp);
+    return merged;
+  })();
+
   return (
     <div style={{ width: '100%', height: '100%', position: 'relative' }}>
+      {/* Conflict resolution banner */}
+      {conflict && (
+        <div style={{
+          position: 'absolute', top: 0, left: 0, right: 0, zIndex: 100,
+          background: '#fff3cd', borderBottom: '2px solid #ffc107',
+          padding: '10px 16px', display: 'flex', alignItems: 'center',
+          gap: 12, fontFamily: 'system-ui', fontSize: 13,
+        }}>
+          <span style={{ fontWeight: 600, color: '#856404' }}>
+            Your canvas differs from the server.
+          </span>
+          <button onClick={toggleConflictView} style={{
+            padding: '4px 12px', borderRadius: 4, border: '1px solid #856404',
+            background: conflict.viewing === 'local' ? '#856404' : 'transparent',
+            color: conflict.viewing === 'local' ? '#fff' : '#856404',
+            cursor: 'pointer', fontSize: 12,
+          }}>Mine</button>
+          <button onClick={toggleConflictView} style={{
+            padding: '4px 12px', borderRadius: 4, border: '1px solid #856404',
+            background: conflict.viewing === 'server' ? '#856404' : 'transparent',
+            color: conflict.viewing === 'server' ? '#fff' : '#856404',
+            cursor: 'pointer', fontSize: 12,
+          }}>Server's</button>
+          <div style={{ flex: 1 }} />
+          <button onClick={() => resolveConflict('local')} style={{
+            padding: '5px 14px', borderRadius: 4, border: 'none',
+            background: '#2f9e44', color: '#fff', cursor: 'pointer',
+            fontWeight: 600, fontSize: 12,
+          }}>Keep mine</button>
+          <button onClick={() => resolveConflict('server')} style={{
+            padding: '5px 14px', borderRadius: 4, border: 'none',
+            background: '#1971c2', color: '#fff', cursor: 'pointer',
+            fontWeight: 600, fontSize: 12,
+          }}>Use server's</button>
+        </div>
+      )}
+
+      {/* History button */}
+      <button
+        onClick={showHistory ? () => { if (previewingVersion) cancelPreview(); setShowHistory(false); } : openHistory}
+        title="Version History (Ctrl+H)"
+        style={{
+          position: 'absolute', top: 12, right: 12, zIndex: 50,
+          padding: '6px 12px', borderRadius: 6,
+          border: '1px solid #dee2e6', background: showHistory ? '#e9ecef' : '#fff',
+          cursor: 'pointer', fontFamily: 'system-ui', fontSize: 12,
+          color: '#495057', boxShadow: '0 1px 3px rgba(0,0,0,0.1)',
+        }}
+      >
+        History
+      </button>
+
+      {/* Version history panel */}
+      {showHistory && (
+        <div style={{
+          position: 'absolute', top: 0, right: 0, bottom: 0, width: 320,
+          zIndex: 90, background: '#fff', borderLeft: '1px solid #dee2e6',
+          display: 'flex', flexDirection: 'column', fontFamily: 'system-ui',
+          boxShadow: '-2px 0 8px rgba(0,0,0,0.1)',
+        }}>
+          <div style={{
+            padding: '12px 16px', borderBottom: '1px solid #dee2e6',
+            display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+          }}>
+            <span style={{ fontWeight: 600, fontSize: 14 }}>Version History</span>
+            <button onClick={() => { if (previewingVersion) cancelPreview(); setShowHistory(false); }} style={{
+              background: 'none', border: 'none', cursor: 'pointer', fontSize: 18, color: '#868e96',
+            }}>&times;</button>
+          </div>
+          <div style={{ flex: 1, overflowY: 'auto', padding: '8px 0' }}>
+            {allVersions.length === 0 ? (
+              <div style={{ padding: '20px 16px', color: '#868e96', fontSize: 13, textAlign: 'center' }}>
+                No version history yet. Edits are saved automatically.
+              </div>
+            ) : allVersions.map((v, i) => (
+              <div key={`${v.timestamp}-${i}`} style={{
+                padding: '8px 16px', borderBottom: '1px solid #f1f3f5',
+                display: 'flex', flexDirection: 'column', gap: 4,
+              }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span style={{ fontSize: 12, color: '#495057' }}>
+                    {new Date(v.timestamp).toLocaleString()}
+                  </span>
+                  <span style={{
+                    fontSize: 10, padding: '1px 6px', borderRadius: 3,
+                    background: v.source === 'local' ? '#d3f9d8' :
+                      v.source === 'server' ? '#d0ebff' :
+                      v.source === 'restored' ? '#e7f5ff' :
+                      v.source === 'server-backup' ? '#fff3bf' :
+                      v.source.startsWith('conflict') ? '#ffe3e3' : '#f1f3f5',
+                    color: '#495057',
+                  }}>
+                    {v.source}
+                  </span>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span style={{ fontSize: 11, color: '#868e96' }}>{v.elementCount} elements</span>
+                  <div style={{ display: 'flex', gap: 4 }}>
+                    {v.elements && (
+                      <button onClick={() => previewVersion(v.elements!)} style={{
+                        padding: '2px 8px', borderRadius: 3, border: '1px solid #dee2e6',
+                        background: '#fff', cursor: 'pointer', fontSize: 11, color: '#495057',
+                      }}>Preview</button>
+                    )}
+                    <button onClick={() => {
+                      if (v.elements) {
+                        restoreVersion(v.elements, 'local');
+                      } else if (v.serverTimestamp) {
+                        restoreVersion([], 'server', v.serverTimestamp);
+                      }
+                    }} style={{
+                      padding: '2px 8px', borderRadius: 3, border: 'none',
+                      background: '#228be6', color: '#fff', cursor: 'pointer', fontSize: 11,
+                    }}>Restore</button>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+          {previewingVersion && (
+            <div style={{
+              padding: '10px 16px', borderTop: '1px solid #dee2e6',
+              background: '#fff9db', display: 'flex', justifyContent: 'space-between',
+              alignItems: 'center',
+            }}>
+              <span style={{ fontSize: 12, color: '#856404' }}>Previewing version</span>
+              <button onClick={cancelPreview} style={{
+                padding: '3px 10px', borderRadius: 3, border: '1px solid #856404',
+                background: 'transparent', color: '#856404', cursor: 'pointer', fontSize: 11,
+              }}>Cancel preview</button>
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Status bar */}
       <div
         style={{

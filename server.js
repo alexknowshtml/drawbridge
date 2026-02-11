@@ -27,13 +27,14 @@ import express from 'express';
 import { WebSocketServer, WebSocket } from 'ws';
 import { createServer } from 'http';
 import { parse } from 'url';
-import { mkdirSync, existsSync, readFileSync, writeFileSync, appendFileSync, unlinkSync, renameSync } from 'fs';
+import { mkdirSync, existsSync, readFileSync, writeFileSync, appendFileSync, unlinkSync, renameSync, readdirSync, statSync, copyFileSync } from 'fs';
 import { join } from 'path';
-import { initSpacesClient, isSpacesEnabled, uploadFile } from './lib/spaces-client.js';
+import { initSpacesClient, isSpacesEnabled, getSpacesInternals, uploadFile } from './lib/spaces-client.js';
 
 const PORT = parseInt(process.env.DRAWBRIDGE_PORT || '3062');
 const DATA_DIR = process.env.DRAWBRIDGE_DATA_DIR || join(import.meta.dirname, 'data');
 const SNAPSHOT_INTERVAL = 20; // Write snapshot every N operations
+const SNAPSHOT_HISTORY_LIMIT = 50; // Keep this many versioned snapshots per session
 
 // Ensure data directory exists
 mkdirSync(DATA_DIR, { recursive: true });
@@ -49,13 +50,30 @@ function logPath(sessionId) {
 }
 
 function writeSnapshot(sessionId, session) {
-  const tmp = snapshotPath(sessionId) + '.tmp';
-  writeFileSync(tmp, JSON.stringify({
+  const sp = snapshotPath(sessionId);
+  const snapshotData = {
     elements: session.elements,
     appState: session.appState,
     viewport: session.viewport,
-  }));
-  renameSync(tmp, snapshotPath(sessionId));
+  };
+
+  // Version the current snapshot before overwriting
+  if (existsSync(sp)) {
+    const timestamp = Date.now();
+    const versionedPath = join(DATA_DIR, `${sessionId}.snapshot-${timestamp}.json`);
+    try {
+      copyFileSync(sp, versionedPath);
+    } catch (err) {
+      console.error(`[Persist] Failed to version snapshot for ${sessionId}:`, err.message);
+    }
+    pruneOldSnapshots(sessionId);
+    // Fire-and-forget backup to DO Spaces
+    backupSnapshotToSpaces(sessionId, snapshotData, timestamp);
+  }
+
+  const tmp = sp + '.tmp';
+  writeFileSync(tmp, JSON.stringify(snapshotData));
+  renameSync(tmp, sp);
   // Truncate log after snapshot
   writeFileSync(logPath(sessionId), '');
   session._opsSinceSnapshot = 0;
@@ -132,6 +150,107 @@ function deleteSessionFiles(sessionId) {
   try { unlinkSync(snapshotPath(sessionId)); } catch {}
   try { unlinkSync(logPath(sessionId)); } catch {}
   try { unlinkSync(filesMetaPath(sessionId)); } catch {}
+}
+
+// --- Snapshot versioning helpers ---
+
+function listSnapshots(sessionId) {
+  const prefix = `${sessionId}.snapshot-`;
+  try {
+    const files = readdirSync(DATA_DIR)
+      .filter(f => f.startsWith(prefix) && f.endsWith('.json'))
+      .map(f => {
+        const timestamp = parseInt(f.slice(prefix.length, -5), 10);
+        const fullPath = join(DATA_DIR, f);
+        const stat = statSync(fullPath);
+        let elementCount = 0;
+        try {
+          const data = JSON.parse(readFileSync(fullPath, 'utf-8'));
+          elementCount = (data.elements || []).length;
+        } catch {}
+        return { timestamp, elementCount, size: stat.size, filename: f };
+      })
+      .sort((a, b) => b.timestamp - a.timestamp); // newest first
+    return files;
+  } catch {
+    return [];
+  }
+}
+
+function pruneOldSnapshots(sessionId) {
+  const versions = listSnapshots(sessionId);
+  if (versions.length <= SNAPSHOT_HISTORY_LIMIT) return;
+  const toDelete = versions.slice(SNAPSHOT_HISTORY_LIMIT);
+  for (const v of toDelete) {
+    try {
+      unlinkSync(join(DATA_DIR, v.filename));
+    } catch {}
+  }
+  if (toDelete.length > 0) {
+    console.log(`[Persist] Pruned ${toDelete.length} old snapshots for ${sessionId}`);
+  }
+}
+
+function restoreSnapshot(sessionId, timestamp) {
+  const versionedPath = join(DATA_DIR, `${sessionId}.snapshot-${timestamp}.json`);
+  if (!existsSync(versionedPath)) return null;
+
+  try {
+    const data = JSON.parse(readFileSync(versionedPath, 'utf-8'));
+    const session = getSession(sessionId);
+
+    // Save current state as a new version before restoring
+    writeSnapshot(sessionId, session);
+
+    // Apply restored state
+    session.elements = data.elements || [];
+    session.appState = data.appState || null;
+    session.viewport = data.viewport || null;
+
+    // Write the restored state as the current snapshot
+    const tmp = snapshotPath(sessionId) + '.tmp';
+    writeFileSync(tmp, JSON.stringify(data));
+    renameSync(tmp, snapshotPath(sessionId));
+    writeFileSync(logPath(sessionId), '');
+    session._opsSinceSnapshot = 0;
+
+    // Broadcast to all connected clients
+    broadcast(session, {
+      type: 'elements',
+      elements: session.elements,
+      appState: session.appState,
+      source: 'restore',
+    });
+
+    console.log(`[Persist] Restored session ${sessionId} to snapshot ${timestamp} (${session.elements.length} elements)`);
+    return { elements: session.elements, elementCount: session.elements.length };
+  } catch (err) {
+    console.error(`[Persist] Failed to restore snapshot ${timestamp} for ${sessionId}:`, err.message);
+    return null;
+  }
+}
+
+async function backupSnapshotToSpaces(sessionId, snapshotData, timestamp) {
+  if (!isSpacesEnabled()) return;
+  try {
+    const { PutObjectCommand } = await import('@aws-sdk/client-s3');
+    const { s3Client: client, spacesConfig: config } = getSpacesInternals();
+    if (!client || !config) return;
+
+    const key = `snapshots/${sessionId}/${sessionId}.snapshot-${timestamp}.json`;
+    const body = JSON.stringify(snapshotData);
+
+    await client.send(new PutObjectCommand({
+      Bucket: config.bucket,
+      Key: key,
+      Body: body,
+      ContentType: 'application/json',
+      ACL: 'private',
+    }));
+    console.log(`[Spaces] Backed up snapshot ${sessionId} @ ${timestamp}`);
+  } catch (err) {
+    console.error(`[Spaces] Snapshot backup failed for ${sessionId}:`, err.message);
+  }
 }
 
 // --- File metadata persistence (image CDN URLs) ---
@@ -438,6 +557,47 @@ app.get('/api/session/:id/files/:fileId', async (req, res) => {
   }
 });
 
+// --- Snapshot version API endpoints ---
+
+// List available snapshot versions for a session
+app.get('/api/session/:id/versions', (req, res) => {
+  const sessionId = req.params.id;
+  const versions = listSnapshots(sessionId);
+
+  // Also include the current snapshot if it exists
+  const sp = snapshotPath(sessionId);
+  let current = null;
+  if (existsSync(sp)) {
+    try {
+      const stat = statSync(sp);
+      const data = JSON.parse(readFileSync(sp, 'utf-8'));
+      current = {
+        timestamp: Math.floor(stat.mtimeMs),
+        elementCount: (data.elements || []).length,
+        size: stat.size,
+        isCurrent: true,
+      };
+    } catch {}
+  }
+
+  res.json({ current, versions });
+});
+
+// Restore a session from a specific versioned snapshot
+app.post('/api/session/:id/restore', (req, res) => {
+  const { timestamp } = req.body;
+  if (!timestamp) {
+    return res.status(400).json({ error: 'Missing timestamp' });
+  }
+
+  const result = restoreSnapshot(req.params.id, timestamp);
+  if (result) {
+    res.json({ success: true, ...result });
+  } else {
+    res.status(404).json({ error: 'Snapshot not found or restore failed' });
+  }
+});
+
 // Serve built frontend (for containerized/production deployment)
 const staticDir = join(import.meta.dirname, 'dist');
 if (existsSync(staticDir)) {
@@ -537,3 +697,25 @@ if (initSpacesClient(process.env)) {
 httpServer.listen(PORT, () => {
   console.log(`[HTTP] API + WebSocket server running on port ${PORT}`);
 });
+
+// --- Graceful shutdown: flush all in-memory sessions to disk ---
+
+function gracefulShutdown(signal) {
+  console.log(`\n[Shutdown] Received ${signal}, flushing sessions...`);
+  let flushed = 0;
+  for (const [sessionId, session] of sessions) {
+    if (session.elements.length > 0) {
+      try {
+        writeSnapshot(sessionId, session);
+        flushed++;
+      } catch (err) {
+        console.error(`[Shutdown] Failed to flush session ${sessionId}:`, err.message);
+      }
+    }
+  }
+  console.log(`[Shutdown] Flushed ${flushed} sessions to disk`);
+  process.exit(0);
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
