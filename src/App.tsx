@@ -798,19 +798,22 @@ export default function App() {
         </div>
       )}
 
-      {/* History button */}
+      {/* History button — matches Excalidraw undo/redo style, positioned beside them */}
       <button
         onClick={showHistory ? () => { if (previewingVersion) cancelPreview(); setShowHistory(false); } : openHistory}
         title="Version History (Ctrl+H)"
         style={{
-          position: 'absolute', top: 12, right: 12, zIndex: 50,
-          padding: '6px 12px', borderRadius: 6,
-          border: '1px solid #dee2e6', background: showHistory ? '#e9ecef' : '#fff',
-          cursor: 'pointer', fontFamily: 'system-ui', fontSize: 12,
-          color: '#495057', boxShadow: '0 1px 3px rgba(0,0,0,0.1)',
+          position: 'absolute', bottom: 80, left: 16, zIndex: 50,
+          width: 36, height: 36, borderRadius: 8,
+          border: 'none', background: showHistory ? '#d0ebff' : '#ececf4',
+          cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
+          boxShadow: '0 0 0 1px rgba(0,0,0,0.05)',
         }}
       >
-        History
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#495057" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <circle cx="12" cy="12" r="10" />
+          <polyline points="12 6 12 12 16 14" />
+        </svg>
       </button>
 
       {/* Version history panel */}
