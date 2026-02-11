@@ -788,11 +788,11 @@ export default function App() {
   })();
 
   return (
-    <div style={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column' }}>
+    <div style={{ width: '100%', height: '100%', position: 'relative' }}>
       {/* Conflict resolution banner */}
       {conflict && (
         <div style={{
-          flexShrink: 0,
+          position: 'absolute', top: 0, left: 0, right: 0, zIndex: 100,
           background: '#fff3cd', borderBottom: '2px solid #ffc107',
           padding: '10px 16px', display: 'flex', alignItems: 'center',
           gap: 12, fontFamily: 'system-ui', fontSize: 13,
@@ -826,8 +826,6 @@ export default function App() {
         </div>
       )}
 
-      {/* Canvas area — flex-grows to fill remaining space */}
-      <div style={{ flex: 1, position: 'relative', minHeight: 0 }}>
       {/* History button — matches Excalidraw undo/redo style, positioned beside them */}
       <button
         onClick={showHistory ? () => { if (previewingVersion) cancelPreview(); setShowHistory(false); } : openHistory}
@@ -966,12 +964,11 @@ export default function App() {
           },
         }}
       />
-      </div>
 
       {/* Preview mode banner — bottom bar */}
       {previewingVersion && !conflict && (
         <div style={{
-          flexShrink: 0,
+          position: 'absolute', bottom: 0, left: 0, right: 0, zIndex: 100,
           background: '#fff9db', borderTop: '2px solid #fab005',
           padding: '10px 16px', display: 'flex', alignItems: 'center',
           gap: 12, fontFamily: 'system-ui', fontSize: 13,
