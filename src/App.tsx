@@ -417,6 +417,7 @@ export default function App() {
     let ws: WebSocket | null = null;
     let timer: number | null = null;
     let destroyed = false;
+    let isFirstElementsMsg = true; // Only check for conflicts on first msg after (re)connect
 
     function connect() {
       if (destroyed) return;
@@ -426,6 +427,7 @@ export default function App() {
         wsRef.current = ws;
 
         ws.onopen = () => {
+          isFirstElementsMsg = true;
           setConnected(true);
           setStatus(`Connected - Session: ${sessionId}`);
           if (timer) { clearTimeout(timer); timer = null; }
@@ -438,14 +440,22 @@ export default function App() {
 
             if (msg.type === 'elements' && api) {
               const serverElements = await sanitizeElements(msg.elements);
-              const localElements = api.getSceneElements().filter((el: any) => !el.isDeleted);
 
-              // Compare element IDs to detect conflicts
-              const localIds = localElements.map((el: any) => el.id).sort().join(',');
-              const serverIds = serverElements.map((el: any) => el.id).sort().join(',');
-              const hasConflict = localIds !== serverIds && localElements.length > 0;
+              // Only check for conflicts on the first elements message after (re)connect
+              // Normal collaborative updates should apply silently
+              const shouldCheckConflict = isFirstElementsMsg && !msg.source;
+              isFirstElementsMsg = false;
 
-              if (hasConflict && !msg.source) {
+              let hasConflict = false;
+              let localElements: any[] = [];
+              if (shouldCheckConflict) {
+                localElements = api.getSceneElements().filter((el: any) => !el.isDeleted);
+                const localIds = localElements.map((el: any) => el.id).sort().join(',');
+                const serverIds = serverElements.map((el: any) => el.id).sort().join(',');
+                hasConflict = localIds !== serverIds && localElements.length > 0;
+              }
+
+              if (hasConflict) {
                 // Save both states to IndexedDB
                 await versionHistory.saveVersion(sessionId, localElements, 'conflict-local');
                 await versionHistory.saveVersion(sessionId, serverElements, 'conflict-server');
