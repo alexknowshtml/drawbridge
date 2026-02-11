@@ -1,13 +1,16 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import { execSync } from 'child_process';
+import { readFileSync } from 'fs';
 
 let gitHash = 'dev';
 try {
   gitHash = execSync('git rev-parse --short HEAD').toString().trim();
 } catch {
-  // git not available (e.g., in Docker build) — use BUILD_VERSION env or fallback
-  gitHash = process.env.BUILD_VERSION || 'dev';
+  // git not available (e.g., Docker build) — read from .build-version file
+  try {
+    gitHash = readFileSync('.build-version', 'utf-8').trim();
+  } catch {}
 }
 
 export default defineConfig({

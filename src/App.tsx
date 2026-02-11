@@ -985,7 +985,7 @@ export default function App() {
           style={{ cursor: 'pointer', borderBottom: '1px dashed currentColor' }}
           title="Click to set your name"
         >
-          {clientName || clientId}
+          {clientName ? `${clientName} (${clientId})` : clientId}
         </span>
         <span style={{ opacity: 0.4, fontSize: 10 }}>v{__APP_VERSION__}</span>
       </div>

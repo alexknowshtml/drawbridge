@@ -4,3 +4,4 @@ data/
 *.log
 .DS_Store
 .env
+.build-version
