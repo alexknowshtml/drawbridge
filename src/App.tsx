@@ -111,6 +111,7 @@ interface VersionEntry {
   elements: any[];
   elementCount: number;
   source: 'local' | 'server' | 'restored' | 'conflict-local' | 'conflict-server';
+  restoredFrom?: number; // version number this was restored from
 }
 
 class VersionHistory {
@@ -132,7 +133,7 @@ class VersionHistory {
     });
   }
 
-  async saveVersion(sessionId: string, elements: any[], source: VersionEntry['source'] = 'local'): Promise<void> {
+  async saveVersion(sessionId: string, elements: any[], source: VersionEntry['source'] = 'local', restoredFrom?: number): Promise<void> {
     try {
       const db = await this.dbPromise;
       const tx = db.transaction(IDB_STORE, 'readwrite');
@@ -143,6 +144,7 @@ class VersionHistory {
         elements,
         elementCount: elements.length,
         source,
+        ...(restoredFrom !== undefined && { restoredFrom }),
       };
       store.add(entry);
       await new Promise<void>((resolve, reject) => {
@@ -673,7 +675,7 @@ export default function App() {
     setTimeout(() => { isRemoteUpdate.current = false; }, 100);
   }, [excalidrawAPI]);
 
-  const restoreVersion = useCallback(async (elements: any[], source: 'local' | 'server', serverTimestamp?: number) => {
+  const restoreVersion = useCallback(async (elements: any[], source: 'local' | 'server', serverTimestamp?: number, fromVersion?: number) => {
     if (!excalidrawAPI) return;
 
     if (source === 'server' && serverTimestamp) {
@@ -693,7 +695,7 @@ export default function App() {
       excalidrawAPI.updateScene({ elements });
       lastElementCount.current = elements.length;
       saveToStorage(sessionId, elements);
-      await versionHistory.saveVersion(sessionId, elements, 'restored');
+      await versionHistory.saveVersion(sessionId, elements, 'restored', fromVersion);
 
       if (wsRef.current?.readyState === WebSocket.OPEN) {
         wsRef.current.send(JSON.stringify({ type: 'update', elements }));
@@ -732,6 +734,7 @@ export default function App() {
       source: string;
       elements?: any[];
       serverTimestamp?: number;
+      restoredFrom?: number;
     }> = [];
 
     for (const entry of historyEntries) {
@@ -740,6 +743,7 @@ export default function App() {
         elementCount: entry.elementCount,
         source: entry.source,
         elements: entry.elements,
+        restoredFrom: entry.restoredFrom,
       });
     }
 
@@ -854,7 +858,7 @@ export default function App() {
                       }}>
                         {v.source === 'local' ? 'edit' :
                          v.source === 'server' ? 'synced' :
-                         v.source === 'restored' ? 'restored' :
+                         v.source === 'restored' ? (v.restoredFrom ? `from v${v.restoredFrom}` : 'restored') :
                          v.source === 'conflict-local' ? 'conflict (yours)' :
                          v.source === 'conflict-server' ? 'conflict (server)' : v.source}
                       </span>
@@ -869,9 +873,9 @@ export default function App() {
                     )}
                     <button onClick={() => {
                       if (v.elements) {
-                        restoreVersion(v.elements, 'local');
+                        restoreVersion(v.elements, 'local', undefined, v.version);
                       } else if (v.serverTimestamp) {
-                        restoreVersion([], 'server', v.serverTimestamp);
+                        restoreVersion([], 'server', v.serverTimestamp, v.version);
                       }
                     }} style={{
                       padding: '2px 8px', borderRadius: 3, border: 'none',
