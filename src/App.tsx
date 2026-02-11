@@ -836,9 +836,11 @@ export default function App() {
                 padding: '8px 16px', borderBottom: '1px solid #f1f3f5',
                 display: 'flex', flexDirection: 'column', gap: 4,
               }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                  <span style={{ fontSize: 12, color: '#1a1a1a', fontWeight: 500 }}>
-                    v{v.version}
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <span style={{ fontSize: 12, color: '#1a1a1a', fontWeight: 500 }}>v{v.version}</span>
+                  <span style={{ fontSize: 11, color: '#868e96' }}>
+                    {new Date(v.timestamp).toLocaleDateString([], { month: 'short', day: 'numeric' })}{' '}
+                    {new Date(v.timestamp).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}
                   </span>
                   <span style={{
                     fontSize: 10, padding: '1px 6px', borderRadius: 3,
@@ -855,11 +857,7 @@ export default function App() {
                      v.source === 'conflict-server' ? 'conflict (server)' : v.source}
                   </span>
                 </div>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                  <span style={{ fontSize: 11, color: '#868e96' }}>
-                    {new Date(v.timestamp).toLocaleDateString([], { month: 'short', day: 'numeric' })}{' '}
-                    {new Date(v.timestamp).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}
-                  </span>
+                <div style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center' }}>
                   <div style={{ display: 'flex', gap: 4 }}>
                     {v.elements && (
                       <button onClick={() => previewVersion(v.elements!)} style={{
