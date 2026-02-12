@@ -1,17 +1,16 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
-import { execSync } from 'child_process';
-import { readFileSync } from 'fs';
 
-let gitHash = 'dev';
-try {
-  gitHash = execSync('git rev-parse --short HEAD').toString().trim();
-} catch {
-  // git not available (e.g., Docker build) — read from .build-version file
-  try {
-    gitHash = readFileSync('.build-version', 'utf-8').trim();
-  } catch {}
-}
+// Build timestamp: YYMMDD-HHmm (e.g., "250212-0035")
+const now = new Date();
+const buildId = [
+  String(now.getFullYear()).slice(2),
+  String(now.getMonth() + 1).padStart(2, '0'),
+  String(now.getDate()).padStart(2, '0'),
+  '-',
+  String(now.getHours()).padStart(2, '0'),
+  String(now.getMinutes()).padStart(2, '0'),
+].join('');
 
 export default defineConfig({
   plugins: [react()],
@@ -21,6 +20,6 @@ export default defineConfig({
   },
   define: {
     'process.env.IS_PREACT': JSON.stringify('false'),
-    '__APP_VERSION__': JSON.stringify(gitHash),
+    '__APP_VERSION__': JSON.stringify(buildId),
   },
 });

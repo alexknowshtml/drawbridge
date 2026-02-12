@@ -820,8 +820,21 @@ export default function App() {
       try {
         let inner: string;
         if (text[0] === '"') {
-          inner = JSON.parse(text);
+          // Find the closing quote of the JSON string literal (skip escaped quotes)
+          let closingQuote = -1;
+          let esc = false;
+          for (let i = 1; i < text.length; i++) {
+            if (esc) { esc = false; continue; }
+            if (text[i] === '\\') { esc = true; continue; }
+            if (text[i] === '"') { closingQuote = i; break; }
+          }
+          if (closingQuote < 0) return;
+
+          // Parse only the JSON string literal, ignoring any trailing data
+          inner = JSON.parse(text.slice(0, closingQuote + 1));
           if (typeof inner !== 'string') return;
+          // Re-escape control characters that JSON.parse unescaped
+          inner = inner.replace(/[\x00-\x1f]/g, (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'));
           console.log('[Paste] Unwrapped double-encoding, inner length:', inner.length);
         } else if (text[0] === '{') {
           inner = text;
@@ -832,12 +845,20 @@ export default function App() {
         let parsed: any;
         try {
           parsed = JSON.parse(inner);
-        } catch {
-          console.log('[Paste] Direct parse failed, using brace matcher');
+        } catch (e: any) {
+          const pos = parseInt(e.message?.match(/position (\d+)/)?.[1] || '0', 10);
+          console.log('[Paste] Direct parse failed at pos', pos, '/', inner.length,
+            'chars:', JSON.stringify(inner.slice(Math.max(0, pos - 30), pos + 30)));
           const end = findJsonObjectEnd(inner);
-          console.log('[Paste] Brace matcher found end at:', end, 'of', inner.length);
+          console.log('[Paste] Brace matcher found end at:', end);
           if (end < 0) return;
-          parsed = JSON.parse(inner.slice(0, end + 1));
+          try {
+            parsed = JSON.parse(inner.slice(0, end + 1));
+            console.log('[Paste] Brace-trimmed parse succeeded');
+          } catch (e2: any) {
+            console.error('[Paste] Brace-trimmed parse also failed:', e2.message);
+            return;
+          }
         }
 
         if (parsed?.type?.includes('excalidraw') && Array.isArray(parsed.elements) && parsed.elements.length > 0) {
