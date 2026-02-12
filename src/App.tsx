@@ -792,6 +792,83 @@ export default function App() {
     return () => window.removeEventListener('keydown', handler);
   }, [showHistory, previewingVersion, cancelPreview, openHistory]);
 
+  // Intercept paste to fix double-encoded Excalidraw clipboard data (from excalidraw.com)
+  // Registered on window (not document) in capture phase so it runs BEFORE Excalidraw's handler
+  useEffect(() => {
+    function findJsonObjectEnd(str: string): number {
+      let depth = 0;
+      let inString = false;
+      let escaped = false;
+      for (let i = 0; i < str.length; i++) {
+        const c = str[i];
+        if (escaped) { escaped = false; continue; }
+        if (c === '\\') { escaped = true; continue; }
+        if (c === '"') { inString = !inString; continue; }
+        if (inString) continue;
+        if (c === '{') depth++;
+        if (c === '}') { depth--; if (depth === 0) return i; }
+      }
+      return -1;
+    }
+
+    const handler = (e: ClipboardEvent) => {
+      const text = e.clipboardData?.getData('text/plain') || '';
+      if (!text || !text.includes('excalidraw/clipboard')) return;
+
+      console.log('[Paste] Intercepted excalidraw clipboard data, length:', text.length);
+
+      try {
+        let inner: string;
+        if (text[0] === '"') {
+          inner = JSON.parse(text);
+          if (typeof inner !== 'string') return;
+          console.log('[Paste] Unwrapped double-encoding, inner length:', inner.length);
+        } else if (text[0] === '{') {
+          inner = text;
+        } else {
+          return;
+        }
+
+        let parsed: any;
+        try {
+          parsed = JSON.parse(inner);
+        } catch {
+          console.log('[Paste] Direct parse failed, using brace matcher');
+          const end = findJsonObjectEnd(inner);
+          console.log('[Paste] Brace matcher found end at:', end, 'of', inner.length);
+          if (end < 0) return;
+          parsed = JSON.parse(inner.slice(0, end + 1));
+        }
+
+        if (parsed?.type?.includes('excalidraw') && Array.isArray(parsed.elements) && parsed.elements.length > 0) {
+          // Stop event SYNCHRONOUSLY before any async work
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          console.log('[Paste] Blocked event, importing', parsed.elements.length, 'elements');
+
+          const api = apiRef.current;
+          if (!api) return;
+
+          // Do the async element processing after blocking the event
+          sanitizeElements(parsed.elements).then(elements => {
+            if (elements.length > 0 && apiRef.current) {
+              const current = apiRef.current.getSceneElements();
+              apiRef.current.updateScene({ elements: [...current, ...elements] });
+              if (parsed.files && Object.keys(parsed.files).length > 0) {
+                apiRef.current.addFiles(Object.values(parsed.files));
+              }
+              console.log(`[Paste] Imported ${elements.length} elements from external Excalidraw`);
+            }
+          });
+        }
+      } catch (err) {
+        console.error('[Paste] Handler error:', err);
+      }
+    };
+    window.addEventListener('paste', handler, true);
+    return () => window.removeEventListener('paste', handler, true);
+  }, []);
+
   // Merge local + server versions for the history panel
   const allVersions = (() => {
     const merged: Array<{

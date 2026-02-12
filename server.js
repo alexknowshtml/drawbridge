@@ -55,6 +55,7 @@ function writeSnapshot(sessionId, session) {
     elements: session.elements,
     appState: session.appState,
     viewport: session.viewport,
+    _version: session._version,
   };
 
   // Version the current snapshot before overwriting
@@ -117,6 +118,7 @@ function loadSession(sessionId) {
       session.elements = snap.elements || [];
       session.appState = snap.appState || null;
       session.viewport = snap.viewport || null;
+      session._version = snap._version || 0;
     } catch (err) {
       console.error(`[Persist] Failed to load snapshot for ${sessionId}:`, err.message);
     }
@@ -129,6 +131,7 @@ function loadSession(sessionId) {
       const lines = readFileSync(lp, 'utf-8').split('\n').filter(l => l.trim());
       for (const line of lines) {
         applyOp(session, JSON.parse(line));
+        session._version++;
       }
       // Log entries exist — snapshot may be stale, mark for early flush
     } catch (err) {
