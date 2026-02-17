@@ -29,7 +29,10 @@ function setClientName(name: string) {
   localStorage.setItem('drawbridge:client-name', name);
 }
 
-// Font preloading — ensure Excalidraw fonts are ready before text measurement
+// Font preloading — ensure Excalidraw fonts are ready before text measurement.
+// document.fonts.load() resolves when fonts are downloaded, but canvas measureText()
+// may still use a fallback font briefly. We verify with document.fonts.check() in a
+// retry loop to ensure the font is truly available for measurement.
 let fontsReady: Promise<void> | null = null;
 function ensureFontsLoaded(): Promise<void> {
   if (!fontsReady) {
@@ -38,9 +41,26 @@ function ensureFontsLoaded(): Promise<void> {
       document.fonts.load('400 16px Assistant'),
       document.fonts.load('500 16px Assistant'),
       document.fonts.load('700 16px Assistant'),
-    ]).then(() => {});
+    ])
+      .then(() => document.fonts.ready)
+      .then(() => waitForFontCheck('20px Excalifont'));
   }
   return fontsReady;
+}
+
+function waitForFontCheck(font: string, maxRetries = 20): Promise<void> {
+  return new Promise((resolve) => {
+    let attempts = 0;
+    function check() {
+      if (document.fonts.check(font) || attempts >= maxRetries) {
+        resolve();
+      } else {
+        attempts++;
+        requestAnimationFrame(check);
+      }
+    }
+    check();
+  });
 }
 
 // Detect whether elements are skeleton format (need conversion) or already fully converted
