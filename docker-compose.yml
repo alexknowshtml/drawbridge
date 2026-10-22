@@ -12,3 +12,9 @@ services:
       - .env
     environment:
       - DRAWBRIDGE_PORT=3062
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 10.89.2.0/24
